@@ -1,3 +1,4 @@
+#include "util.hpp"
 #include <iostream>
 #include <opencv2/opencv.hpp>
 
@@ -37,32 +38,22 @@ private:
     int m_descriptor_type;
 };
 
-//class GriddedDescriptors
-//{
-//public:
-//    GriddedDescriptors(cv::Size size, cv::Ptr<cv::Feature2D> detector, cv::Mat descriptors, int grid_size = 10)
-//        : m_grid_size(grid_size), m_row_blocks(size.width / grid_size), m_col_blocks(size.height / grid_size)
-//    {
-//        // グリッドに分解
-//    }
-//
-//private:
-//    const int m_grid_size;  //[pixel]
-//    const int m_row_blocks;
-//    const int m_col_blocks;
-//
-//
-//};
-
-int main(int argc, char* argv[])
+int main(int argc, char** argv)
 {
-    cv::Mat src_image = cv::imread("../data/image01.png");
-    int grid_size = 40;
-    if (argc == 2)
-        grid_size = std::atoi(argv[1]);
+    int grid_size_w = 64;
+    int grid_size_h = 48;
 
-    cv::Mat image1 = src_image.clone();
-    cv::Mat image2 = src_image.clone();  // とりあえず同じ画像
+    if (argc == 2) {
+        float gain = std::atof(argv[1]);
+        grid_size_w *= gain;
+        grid_size_h *= gain;
+    }
+
+    cv::Mat image1;
+    cv::Mat image2;
+    if (not Util::readStereoImage("../data/stereo01.png", image1, image2))
+        return -1;
+    std::cout << "image size" << image1.size() << " " << image2.size() << std::endl;
 
     // Epipolar関係
     cv::Mat E = (cv::Mat_<double>(3, 3) << 0, 0, 0, 0, 0, -1, 0, 1, 0);  // x軸方向に移動した
@@ -78,18 +69,20 @@ int main(int argc, char* argv[])
     detector->detectAndCompute(image1, cv::noArray(), keypoints1, descriptors1);
     detector->detectAndCompute(image2, cv::noArray(), keypoints2, descriptors2);
 
+
     // グリッド分割(とりあえず一方向だけ)
-    int grid_width = std::ceil(1.0 * image2.size().width / grid_size);
-    int grid_height = std::ceil(1.0 * image2.size().height / grid_size);
+    int grid_width = std::ceil(1.0 * image2.size().width / grid_size_w);
+    int grid_height = std::ceil(1.0 * image2.size().height / grid_size_h);
     std::vector<DescriptorWithID> grid_elements2(grid_width * grid_height, DescriptorWithID(detector));
     for (size_t i = 0; i < descriptors2.rows; i++) {
         cv::KeyPoint key = keypoints2.at(i);
         cv::Mat des = descriptors2.row(i);
 
-        int grid_no = (key.pt.x / grid_size) + (key.pt.y / grid_size) * grid_width;
+        int grid_no = static_cast<int>(key.pt.x / grid_size_w) + static_cast<int>(key.pt.y / grid_size_h) * grid_width;
         grid_elements2.at(grid_no).push_back(i, des);
     }
-    std::cout << grid_height << " " << grid_width << std::endl;
+    std::cout << grid_width << " " << grid_height << std::endl;
+
 
     // Matching each keypoints
     cv::BFMatcher matcher(cv::NORM_HAMMING);
@@ -113,8 +106,8 @@ int main(int argc, char* argv[])
         // Merge
         for (size_t w = 0; w < grid_width; w++) {
             for (size_t h = 0; h < grid_height; h++) {
-                double product = a * (w + 0.5) * grid_size + b * (h + 0.5) * grid_size + c;
-                if (std::abs(product) < grid_size * norm) {  // epilineから格子中心までの距離が格子間隔よりも小さければ併合
+                double product = a * (w + 0.5) * grid_size_w + b * (h + 0.5) * grid_size_h + c;
+                if (std::abs(product) < std::max(grid_size_w, grid_size_h) * norm) {  // epilineから格子中心までの距離が格子間隔よりも小さければ併合
                     merged.merge(grid_elements2.at(w + h * grid_width));
                 }
             }
@@ -132,14 +125,10 @@ int main(int argc, char* argv[])
         matches.push_back(cv::DMatch(i, merged.m_ids.at<int>(train), distance));
     }
 
-
     cv::Mat show_image;
     drawMatches(image1, keypoints1, image2, keypoints2, matches, show_image, cv::Scalar::all(-1),
         cv::Scalar::all(-1), std::vector<char>(), cv::DrawMatchesFlags::NOT_DRAW_SINGLE_POINTS);
     cv::imshow("window", show_image);
 
-
-    //cv::namedWindow("window", cv::WINDOW_NORMAL);
-    //cv::imshow("window", src_image);
     cv::waitKey(0);
 }
