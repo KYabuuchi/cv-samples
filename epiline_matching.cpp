@@ -1,6 +1,8 @@
 // Epipolor拘束を利用して，特徴点のマッチングを拘束に行う
-// 画像間の(F行列)or(E行列+内部パラメータ)が必要
+// 画像間のF行列が必要
 // 画像を格子状に分割し，Epilineに近いブロックに含まれる特徴点のみを収集しマッチングをする
+// NOTE: 画像サイズが2枚とも同じであることを仮定している
+// NOTE: F行列がわかる環境下で画像サイズがことなるようなシチュエーションは少ない
 #include "config.hpp"
 #include "util.hpp"
 #include <iostream>
@@ -10,12 +12,8 @@ class DescriptorWithID
 {
 public:
     DescriptorWithID(cv::Ptr<cv::FeatureDetector> detector)
-        : m_descriptor_size(detector->descriptorSize()),
-          m_descriptor_type(detector->descriptorType())
-    {
-        m_descriptors = cv::Mat(0, m_descriptor_size, m_descriptor_type);
-        m_ids = cv::Mat(0, 1, CV_32SC1);
-    }
+        : m_descriptors(0, detector->descriptorSize(), detector->descriptorType()),
+          m_ids(0, 1, CV_32SC1) {}
 
     size_t size() const
     {
@@ -36,85 +34,117 @@ public:
 
     cv::Mat m_descriptors;
     cv::Mat m_ids;
-
-private:
-    int m_descriptor_size;
-    int m_descriptor_type;
 };
 
-// 双方向マッチングする
-std::vector<cv::DMatch> MatchingByEpipolar(
-    cv::Size size1, std::vector<cv::KeyPoint> keypoints1, cv::Mat descriptors1,
-    cv::Size size2, std::vector<cv::KeyPoint> keypoints2, cv::Mat descriptors2,
-    cv::Mat F,
-    cv::Ptr<cv::FeatureDetector> detector, cv::Ptr<cv::DescriptorMatcher> matcher,
-    int grid_size_w = 64, int grid_size_h = 48)
+class MatcherByEpipolar
 {
-    int grid_width = std::ceil(1.0 * size2.width / grid_size_w);
-    int grid_height = std::ceil(1.0 * size2.height / grid_size_h);
-    std::cout << grid_width << " " << grid_height << std::endl;
-
-    // Gridding
-    std::vector<DescriptorWithID> grid_elements2(grid_width * grid_height, DescriptorWithID(detector));
-    for (size_t i = 0; i < descriptors2.rows; i++) {
-        cv::KeyPoint key = keypoints2.at(i);
-        cv::Mat des = descriptors2.row(i);
-
-        int grid_no = static_cast<int>(key.pt.x / grid_size_w) + static_cast<int>(key.pt.y / grid_size_h) * grid_width;
-        grid_elements2.at(grid_no).push_back(i, des);
+public:
+    MatcherByEpipolar(
+        cv::Ptr<cv::FeatureDetector> detector,
+        cv::Ptr<cv::DescriptorMatcher> matcher,
+        cv::Size size,
+        cv::Size grid_size = cv::Size(64, 48))
+        : m_F(cv::Mat::eye(3, 3, CV_64FC1)),
+          m_detector(detector), m_matcher(matcher),
+          m_size(size), m_grid_size(grid_size),
+          m_grid_num(cv::Size(
+              static_cast<int>(std::ceil(1.0 * size.width / grid_size.width)),
+              static_cast<int>(std::ceil(1.0 * size.height / grid_size.height))))
+    {
+        std::cout << "Image : " << m_size << std::endl;
+        std::cout << "Grid  : " << m_grid_num << std::endl;
+        std::cout << "Grid Size: " << m_grid_size << std::endl;
     }
 
-    // Matching each keypoints
-    std::vector<cv::DMatch> matches;
-    for (size_t i = 0; i < descriptors1.rows; i++) {
-        cv::Point2f tmp = keypoints1.at(i).pt;
-        cv::Mat pt = (cv::Mat_<double>(3, 1) << tmp.x, tmp.y, 1);
-        cv::Mat des = descriptors1.row(i);
+    cv::Mat m_F;
+    cv::Ptr<cv::FeatureDetector> m_detector;
+    cv::Ptr<cv::DescriptorMatcher> m_matcher;
+    const cv::Size m_size;
+    const cv::Size m_grid_size;
+    const cv::Size m_grid_num;
 
-        DescriptorWithID merged(detector);
+    // Epipolar拘束を利用して双方向マッチングする(1->2->1)
+    std::vector<cv::DMatch> matching(
+        std::vector<cv::KeyPoint> keypoints1, cv::Mat descriptors1,
+        std::vector<cv::KeyPoint> keypoints2, cv::Mat descriptors2,
+        cv::Mat F)
+    {
+        m_F = F;
+
+        // Gridding
+        m_gridded_elements2 = std::vector<DescriptorWithID>(m_grid_num.width * m_grid_num.height, DescriptorWithID(m_detector));
+        for (int i = 0; i < descriptors2.rows; i++) {
+            cv::KeyPoint key = keypoints2.at(i);
+            cv::Mat des = descriptors2.row(i);
+
+            int grid_no = static_cast<int>(key.pt.x / static_cast<float>(m_grid_size.width))
+                          + static_cast<int>(key.pt.y / static_cast<float>(m_grid_size.height)) * m_grid_num.width;
+            m_gridded_elements2.at(grid_no).push_back(i, des);
+        }
+
+        // Matching each keypoints
+        std::vector<cv::DMatch> matches;
+        for (int i = 0; i < descriptors1.rows; i++) {
+            cv::Point2f tmp = keypoints1.at(i).pt;
+            cv::Mat x1 = (cv::Mat_<double>(3, 1) << tmp.x, tmp.y, 1);
+            cv::Mat des = descriptors1.row(i);
+
+            DescriptorWithID merged = mergeGridsByEpiline(x1, m_F);
+
+            // Matching
+            std::vector<std::vector<cv::DMatch>> tmp_matches;
+            m_matcher->knnMatch(des, merged.m_descriptors, tmp_matches, 1);
+            if (tmp_matches.at(0).empty())
+                continue;
+
+            // push back
+            int train = tmp_matches.at(0).at(0).trainIdx;
+            float distance = tmp_matches.at(0).at(0).distance;
+            matches.push_back(cv::DMatch(i, merged.m_ids.at<int>(train), distance));
+        }
+
+        return matches;
+    }
+
+private:
+    std::vector<DescriptorWithID> m_gridded_elements1;
+    std::vector<DescriptorWithID> m_gridded_elements2;
+
+    DescriptorWithID mergeGridsByEpiline(cv::Mat x1, cv::Mat F)
+    {
+        DescriptorWithID merged(m_detector);
 
         // Epiline
-        cv::Mat line = pt.t() * F;
+        cv::Mat line = x1.t() * F;
         double a = line.at<double>(0);
         double b = line.at<double>(1);
         double c = line.at<double>(2);
         double norm = std::sqrt(a * a + b * b);
-        std::cout << "line: " << line << std::endl;
 
         // Merge
-        for (size_t w = 0; w < grid_width; w++) {
-            for (size_t h = 0; h < grid_height; h++) {
+        for (int w = 0; w < m_grid_num.width; w++) {
+            for (int h = 0; h < m_grid_num.height; h++) {
 
                 // epilineから格子中心までの距離が格子間隔よりも小さければ併合
-                double product = a * (w + 0.5) * grid_size_w + b * (h + 0.5) * grid_size_h + c;
-                if (std::abs(product) < std::max(grid_size_w, grid_size_h) * norm) {
-                    merged.merge(grid_elements2.at(w + h * grid_width));
+                double product = a * (w + 0.5) * m_grid_size.width + b * (h + 0.5) * m_grid_size.height + c;  // (ax+by+x)/sqrt(aa+bb) < grid_size
+                if (std::abs(product) < std::max(m_grid_size.width, m_grid_size.height) * norm) {
+                    merged.merge(m_gridded_elements2.at(w + h * m_grid_num.width));
                 }
             }
         }
 
-        // Matching
-        std::vector<std::vector<cv::DMatch>> tmp_matches;
-        matcher->knnMatch(des, merged.m_descriptors, tmp_matches, 1);  // 1対多のマッチング
-
-        // Trasnlate
-        int query = tmp_matches.at(0).at(0).queryIdx;
-        int train = tmp_matches.at(0).at(0).trainIdx;
-        float distance = tmp_matches.at(0).at(0).distance;
-        matches.push_back(cv::DMatch(i, merged.m_ids.at<int>(train), distance));
+        return merged;
     }
+};
 
-    return matches;
-}
 
 int main(int argc, char** argv)
 {
-    int grid_size_w = 64;
-    int grid_size_h = 48;
+    cv::Size grid_size(64, 48);
     if (argc == 2) {
-        float gain = std::atof(argv[1]);
-        grid_size_w *= gain;
-        grid_size_h *= gain;
+        double gain = std::atof(argv[1]);
+        grid_size.width = static_cast<int>(gain * grid_size.width);
+        grid_size.height = static_cast<int>(gain * grid_size.height);
     }
 
     // Load Image
@@ -134,7 +164,7 @@ int main(int argc, char** argv)
     // detector & matcher
     cv::Ptr<cv::FeatureDetector> detector = cv::AKAZE::create();
     cv::Ptr<cv::DescriptorMatcher> matcher = cv::BFMatcher::create(cv::NORM_HAMMING);
-    std::cout << "detector: " << detector->getDefaultName() << "matcher: " << matcher->getDefaultName() << std::endl;
+    std::cout << "detector: " << detector->getDefaultName() << std::endl;
 
     // Detect & Descript Features
     std::vector<cv::KeyPoint> keypoints1, keypoints2;
@@ -142,11 +172,11 @@ int main(int argc, char** argv)
     detector->detectAndCompute(image1, cv::noArray(), keypoints1, descriptors1);
     detector->detectAndCompute(image2, cv::noArray(), keypoints2, descriptors2);
 
-    // Matching by using Epipolar Constraint
-    std::vector<cv::DMatch> matches = MatchingByEpipolar(
-        image1.size(), keypoints1, descriptors1,
-        image2.size(), keypoints2, descriptors2,
-        F, detector, matcher, grid_size_w, grid_size_h);
+    // Matching by using Epipolar Constrant
+    MatcherByEpipolar epi_matcher(detector, matcher, image1.size(), grid_size);
+    std::vector<cv::DMatch> matches = epi_matcher.matching(
+        keypoints1, descriptors1,
+        keypoints2, descriptors2, F);
 
     // Show
     cv::Mat show_image;
