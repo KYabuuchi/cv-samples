@@ -51,7 +51,6 @@ public:
               static_cast<int>(std::ceil(1.0 * size.width / grid_size.width)),
               static_cast<int>(std::ceil(1.0 * size.height / grid_size.height))))
     {
-        std::cout << "Image : " << m_size << std::endl;
         std::cout << "Grid  : " << m_grid_num << std::endl;
         std::cout << "Grid Size: " << m_grid_size << std::endl;
     }
@@ -71,6 +70,8 @@ public:
     {
         m_F = F;
 
+        cv::TickMeter tm;
+        tm.start();
         // Gridding
         m_gridded_elements2 = std::vector<DescriptorWithID>(m_grid_num.width * m_grid_num.height, DescriptorWithID(m_detector));
         for (int i = 0; i < descriptors2.rows; i++) {
@@ -81,7 +82,11 @@ public:
                           + static_cast<int>(key.pt.y / static_cast<float>(m_grid_size.height)) * m_grid_num.width;
             m_gridded_elements2.at(grid_no).push_back(i, des);
         }
+        tm.stop();
+        std::cout << tm.getTimeSec() << std::endl;
 
+        tm.reset();
+        tm.start();
         // Matching each keypoints
         std::vector<cv::DMatch> matches;
         for (int i = 0; i < descriptors1.rows; i++) {
@@ -102,6 +107,9 @@ public:
             float distance = tmp_matches.at(0).at(0).distance;
             matches.push_back(cv::DMatch(i, merged.m_ids.at<int>(train), distance));
         }
+        tm.stop();
+        std::cout << tm.getTimeSec() << std::endl;
+
 
         return matches;
     }
@@ -119,15 +127,16 @@ private:
         double a = line.at<double>(0);
         double b = line.at<double>(1);
         double c = line.at<double>(2);
-        double norm = std::sqrt(a * a + b * b);
+        double square_norm = m_grid_size.width * m_grid_size.width * (a * a + b * b);
 
         // Merge
         for (int w = 0; w < m_grid_num.width; w++) {
             for (int h = 0; h < m_grid_num.height; h++) {
-
                 // epilineから格子中心までの距離が格子間隔よりも小さければ併合
-                double product = a * (w + 0.5) * m_grid_size.width + b * (h + 0.5) * m_grid_size.height + c;  // (ax+by+x)/sqrt(aa+bb) < grid_size
-                if (std::abs(product) < std::max(m_grid_size.width, m_grid_size.height) * norm) {
+                double product = a * (w + 0.5) * m_grid_size.width + b * (h + 0.5) * m_grid_size.height + c;
+
+                // (ax+by+c)/sqrt(aa+bb) < grid_size => (ax+by+c)^2  < grid_size^2 * (aa+bb)
+                if (product * product < square_norm) {
                     merged.merge(m_gridded_elements2.at(w + h * m_grid_num.width));
                 }
             }
@@ -136,7 +145,6 @@ private:
         return merged;
     }
 };
-
 
 int main(int argc, char** argv)
 {
@@ -158,12 +166,12 @@ int main(int argc, char** argv)
     cv::Mat T = Params::ZED_EXTRINSIC;
     cv::Mat E = Util::calcEssentialFromRt(T.colRange(0, 3), T.col(3));
     cv::Mat F = K.inv().t() * E * K.inv();
-    std::cout << "Fundamental Matrix\n"
+    std::cout << "Fundamental Matrix:\n"
               << F << std::endl;
 
     // detector & matcher
     cv::Ptr<cv::FeatureDetector> detector = cv::AKAZE::create();
-    cv::Ptr<cv::DescriptorMatcher> matcher = cv::BFMatcher::create(cv::NORM_HAMMING);
+    cv::Ptr<cv::DescriptorMatcher> matcher = cv::BFMatcher::create(detector->defaultNorm());
     std::cout << "detector: " << detector->getDefaultName() << std::endl;
 
     // Detect & Descript Features
@@ -172,18 +180,63 @@ int main(int argc, char** argv)
     detector->detectAndCompute(image1, cv::noArray(), keypoints1, descriptors1);
     detector->detectAndCompute(image2, cv::noArray(), keypoints2, descriptors2);
 
-    // Matching by using Epipolar Constrant
-    MatcherByEpipolar epi_matcher(detector, matcher, image1.size(), grid_size);
-    std::vector<cv::DMatch> matches = epi_matcher.matching(
-        keypoints1, descriptors1,
-        keypoints2, descriptors2, F);
+    {
+        // timer
+        cv::TickMeter tm;
+        tm.start();
 
-    // Show
-    cv::Mat show_image;
-    drawMatches(image1, keypoints1, image2, keypoints2, matches, show_image, cv::Scalar::all(-1),
-        cv::Scalar::all(-1), std::vector<char>(), cv::DrawMatchesFlags::NOT_DRAW_SINGLE_POINTS);
-    cv::namedWindow("window", CV_WINDOW_NORMAL);
-    cv::resizeWindow("window", cv::Size(1280, 480));
-    cv::imshow("window", show_image);
+        std::vector<std::vector<cv::DMatch>> knn_matches;
+        matcher->knnMatch(descriptors1, descriptors2, knn_matches, 2);
+
+        const float r = 0.7f;
+        std::vector<cv::DMatch> matches;
+        for (size_t i = 0; i < knn_matches.size(); i++) {
+            if (knn_matches[i].size() < 2) {
+                //std::cout << knn_matches[i].size() << std::endl;
+                continue;
+            }
+
+            if (knn_matches[i][0].distance < r * knn_matches[i][1].distance) {
+                matches.push_back(knn_matches[i][0]);
+            }
+        }
+
+        // timer
+        tm.stop();
+        std::cout << "\ntime: " << tm.getTimeSec() << std::endl;
+
+        // Show
+        cv::Mat show_image;
+        drawMatches(image1, keypoints1, image2, keypoints2, matches, show_image, cv::Scalar::all(-1),
+            cv::Scalar::all(-1), std::vector<char>(), cv::DrawMatchesFlags::NOT_DRAW_SINGLE_POINTS);
+        cv::namedWindow("window1", CV_WINDOW_NORMAL);
+        cv::resizeWindow("window1", cv::Size(1280, 480));
+        cv::imshow("window1", show_image);
+    }
+
+    {
+        // timer
+        cv::TickMeter tm;
+        tm.start();
+
+        // Matching by using Epipolar Constrant
+        MatcherByEpipolar epi_matcher(detector, matcher, image1.size(), grid_size);
+        std::vector<cv::DMatch> matches = epi_matcher.matching(
+            keypoints1, descriptors1,
+            keypoints2, descriptors2, F);
+
+        // timer
+        tm.stop();
+        std::cout << "\ntime: " << tm.getTimeSec() << std::endl;
+
+        // Show
+        cv::Mat show_image;
+        drawMatches(image1, keypoints1, image2, keypoints2, matches, show_image, cv::Scalar::all(-1),
+            cv::Scalar::all(-1), std::vector<char>(), cv::DrawMatchesFlags::NOT_DRAW_SINGLE_POINTS);
+        cv::namedWindow("window", CV_WINDOW_NORMAL);
+        cv::resizeWindow("window", cv::Size(1280, 480));
+        cv::imshow("window", show_image);
+    }
+
     cv::waitKey(0);
 }
