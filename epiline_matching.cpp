@@ -3,42 +3,20 @@
 // 画像を格子状に分割し，Epilineに近いブロックに含まれる特徴点のみを収集しマッチングをする
 // NOTE: 画像サイズが2枚とも同じであることを仮定している
 // NOTE: F行列がわかる環境下で画像サイズがことなるようなシチュエーションは少ない
+// TODO: むしろ遅いので，cv::Matをコピーしないで済む実装をする
 #include "config.hpp"
 #include "util.hpp"
 #include <iostream>
 #include <opencv2/opencv.hpp>
 
-class DescriptorWithID
-{
-public:
-    DescriptorWithID(cv::Ptr<cv::FeatureDetector> detector)
-        : m_descriptors(0, detector->descriptorSize(), detector->descriptorType()),
-          m_ids(0, 1, CV_32SC1) {}
-
-    size_t size() const
-    {
-        return m_descriptors.rows;
-    }
-
-    void push_back(int id, cv::Mat descriptor)
-    {
-        cv::vconcat(m_ids, id * cv::Mat::ones(1, 1, CV_32SC1), m_ids);
-        m_descriptors.push_back(descriptor);
-    }
-
-    void merge(DescriptorWithID other)
-    {
-        m_descriptors.push_back(other.m_descriptors);
-        m_ids.push_back(other.m_ids);
-    }
-
-    cv::Mat m_descriptors;
-    cv::Mat m_ids;
-};
 
 class MatcherByEpipolar
 {
 public:
+    // 検出器
+    // 対応器
+    // 画像サイズ
+    // 格子のサイズ
     MatcherByEpipolar(
         cv::Ptr<cv::FeatureDetector> detector,
         cv::Ptr<cv::DescriptorMatcher> matcher,
@@ -55,6 +33,7 @@ public:
         std::cout << "Grid Size: " << m_grid_size << std::endl;
     }
 
+    // public member
     cv::Mat m_F;
     cv::Ptr<cv::FeatureDetector> m_detector;
     cv::Ptr<cv::DescriptorMatcher> m_matcher;
@@ -72,21 +51,22 @@ public:
 
         cv::TickMeter tm;
         tm.start();
+
+        std::cout << "hello" << std::endl;
         // Gridding
-        m_gridded_elements2 = std::vector<DescriptorWithID>(m_grid_num.width * m_grid_num.height, DescriptorWithID(m_detector));
+        m_gridded_elements2.clear();
+        m_gridded_elements2.resize(m_grid_num.width * m_grid_num.height);
         for (int i = 0; i < descriptors2.rows; i++) {
             cv::KeyPoint key = keypoints2.at(i);
             cv::Mat des = descriptors2.row(i);
 
             int grid_no = static_cast<int>(key.pt.x / static_cast<float>(m_grid_size.width))
                           + static_cast<int>(key.pt.y / static_cast<float>(m_grid_size.height)) * m_grid_num.width;
-            m_gridded_elements2.at(grid_no).push_back(i, des);
+            m_gridded_elements2.at(grid_no).push_back(i);
         }
         tm.stop();
         std::cout << tm.getTimeSec() << std::endl;
 
-        tm.reset();
-        tm.start();
         // Matching each keypoints
         std::vector<cv::DMatch> matches;
         for (int i = 0; i < descriptors1.rows; i++) {
@@ -94,42 +74,46 @@ public:
             cv::Mat x1 = (cv::Mat_<double>(3, 1) << tmp.x, tmp.y, 1);
             cv::Mat des = descriptors1.row(i);
 
-            DescriptorWithID merged = mergeGridsByEpiline(x1, m_F);
+            tm.reset();
+            tm.start();
+            cv::Mat mask = mergeGridsByEpiline(x1, descriptors2.rows);
+            tm.stop();
+            std::cout << "G " << tm.getTimeSec() << std::endl;
 
+            tm.reset();
+            tm.start();
             // Matching
             std::vector<std::vector<cv::DMatch>> tmp_matches;
-            m_matcher->knnMatch(des, merged.m_descriptors, tmp_matches, 1);
+            m_matcher->knnMatch(des, descriptors2, tmp_matches, 1, mask);
+            tm.stop();
+            std::cout << "M " << tm.getTimeSec() << std::endl;
             if (tmp_matches.at(0).empty())
                 continue;
 
             // push back
             int train = tmp_matches.at(0).at(0).trainIdx;
             float distance = tmp_matches.at(0).at(0).distance;
-            matches.push_back(cv::DMatch(i, merged.m_ids.at<int>(train), distance));
+            matches.push_back(cv::DMatch(i, train, distance));
         }
-        tm.stop();
-        std::cout << tm.getTimeSec() << std::endl;
-
 
         return matches;
     }
 
 private:
-    std::vector<DescriptorWithID> m_gridded_elements1;
-    std::vector<DescriptorWithID> m_gridded_elements2;
+    std::vector<std::vector<size_t>> m_gridded_elements1;
+    std::vector<std::vector<size_t>> m_gridded_elements2;
 
-    DescriptorWithID mergeGridsByEpiline(cv::Mat x1, cv::Mat F)
+    cv::Mat mergeGridsByEpiline(cv::Mat x1, size_t size)
     {
-        DescriptorWithID merged(m_detector);
-
+        cv::Mat mask = cv::Mat::zeros(1, size, CV_8UC1);
         // Epiline
-        cv::Mat line = x1.t() * F;
+        cv::Mat line = x1.t() * m_F;
         double a = line.at<double>(0);
         double b = line.at<double>(1);
         double c = line.at<double>(2);
         double square_norm = m_grid_size.width * m_grid_size.width * (a * a + b * b);
 
-        // Merge
+        int test = 0;
         for (int w = 0; w < m_grid_num.width; w++) {
             for (int h = 0; h < m_grid_num.height; h++) {
                 // epilineから格子中心までの距離が格子間隔よりも小さければ併合
@@ -137,14 +121,19 @@ private:
 
                 // (ax+by+c)/sqrt(aa+bb) < grid_size => (ax+by+c)^2  < grid_size^2 * (aa+bb)
                 if (product * product < square_norm) {
-                    merged.merge(m_gridded_elements2.at(w + h * m_grid_num.width));
+                    std::vector<size_t> candidates = m_gridded_elements2.at(w + h * m_grid_num.width);
+                    for (const size_t& c : candidates) {
+                        mask.at<unsigned char>(0, c) = 1;
+                        test++;
+                    }
                 }
             }
         }
-
-        return merged;
+        // std::cout << test << std::endl;
+        return mask;
     }
 };
+
 
 int main(int argc, char** argv)
 {
@@ -179,6 +168,7 @@ int main(int argc, char** argv)
     cv::Mat descriptors1, descriptors2;
     detector->detectAndCompute(image1, cv::noArray(), keypoints1, descriptors1);
     detector->detectAndCompute(image2, cv::noArray(), keypoints2, descriptors2);
+    std::cout << "feature size " << keypoints1.size() << std::endl;
 
     {
         // timer
@@ -192,7 +182,6 @@ int main(int argc, char** argv)
         std::vector<cv::DMatch> matches;
         for (size_t i = 0; i < knn_matches.size(); i++) {
             if (knn_matches[i].size() < 2) {
-                //std::cout << knn_matches[i].size() << std::endl;
                 continue;
             }
 
